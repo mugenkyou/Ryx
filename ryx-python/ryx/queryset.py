@@ -259,6 +259,7 @@ class QuerySet:
         _group_by: Optional[List[str]] = None,
         _using: Optional[str] = None,
         _select_related: Optional[List[str]] = None,
+        _schema: Optional[str] = None,
     ) -> None:
 
         self._model = model
@@ -267,7 +268,10 @@ class QuerySet:
         self._annotations = _annotations or []
         self._group_by = _group_by or []
         self._using = _using
-        self._select_related: List[str] = list(_select_related) if _select_related else []
+        self._select_related: List[str] = (
+            list(_select_related) if _select_related else []
+        )
+        self._schema = _schema
 
     def _clone(self, **overrides) -> "QuerySet":
         return QuerySet(
@@ -280,6 +284,7 @@ class QuerySet:
             _select_related=overrides.get(
                 "_select_related", list(self._select_related)
             ),
+            _schema=overrides.get("_schema", self._schema),
         )
 
     def _with_op(self, tag: str, payload) -> "QuerySet":
@@ -421,6 +426,31 @@ class QuerySet:
                 field._validate_lookup(lookup)
 
     ##  Filtering
+    def _coerce_filter_value(self, field_name: str, lookup: str, val: Any) -> Any:
+        """Coerce a filter value to the field's Python type.
+
+        PostgreSQL is strict about types: a URL path parameter arrives as a
+        string, but integer/FK columns require an integer. SQLite's loose typing
+        hid this mismatch.
+        """
+        if val is None or isinstance(val, bool):
+            return val
+        if lookup not in ("exact", "gt", "gte", "lt", "lte"):
+            return val
+        field = self._model._meta.fields.get(field_name)
+        if field is None:
+            return val
+        cls_name = type(field).__name__
+        if cls_name in (
+            "IntField", "AutoField", "BigIntField", "SmallIntField",
+            "PositiveIntField", "ForeignKey",
+        ):
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return val
+        return val
+
     def filter(self, *q_args: Q, **kwargs: Any) -> "QuerySet":
         """Add WHERE conditions (AND-ed). Accepts Q objects and kwargs.
 
@@ -443,6 +473,7 @@ class QuerySet:
                 if key == "pk":
                     key = self._model._meta.pk_field.attname
                 field, lookup = _parse_lookup_key(key)
+                val = self._coerce_filter_value(field, lookup, val)
                 batch.append((field, lookup, val, False))
             ops.append(("filters", batch))
 
@@ -775,10 +806,14 @@ class QuerySet:
     def schema(self, schema: str) -> "QuerySet":
         """Set the database schema for this query (PostgreSQL multi-schema).
 
-        Example::
+        Instances fetched through this QuerySet remember the schema, so
+        ``instance.save()`` / ``instance.delete()`` target the same schema::
+
             posts = await Post.objects.schema("tenant1").filter(active=True)
         """
-        return self._with_op("schema", schema)
+        qs = self._with_op("schema", schema)
+        qs._schema = schema
+        return qs
 
     # Evaluation (async)
     def cache(
@@ -859,51 +894,56 @@ class QuerySet:
 
     def _reconstruct_row(self, row: dict) -> "Model":
         if not self._select_related:
-            return self._model._from_row(row)
+            instance = self._model._from_row(row)
+        else:
+            instance = self._model._from_row(row)
+            from ryx.fields import ForeignKey, OneToOneField
+            from ryx.relations import _resolve_model
 
-        instance = self._model._from_row(row)
-        from ryx.fields import ForeignKey, OneToOneField
-        from ryx.relations import _resolve_model
+            for rel_str in self._select_related:
+                if rel_str in self._model._meta.fields:
+                    field = self._model._meta.fields[rel_str]
+                elif f"{rel_str}_id" in self._model._meta.fields:
+                    field = self._model._meta.fields[f"{rel_str}_id"]
+                else:
+                    continue
 
-        for rel_str in self._select_related:
-            if rel_str in self._model._meta.fields:
-                field = self._model._meta.fields[rel_str]
-            elif f"{rel_str}_id" in self._model._meta.fields:
-                field = self._model._meta.fields[f"{rel_str}_id"]
-            else:
-                continue
+                rel_name = rel_str.removesuffix("_id")
+                related_model = _resolve_model(field.to, self._model)
+                prefix = f"{rel_name}__"
 
-            rel_name = rel_str.removesuffix("_id")
-            related_model = _resolve_model(field.to, self._model)
-            prefix = f"{rel_name}__"
+                rel_row = {
+                    k[len(prefix) :]: v
+                    for k, v in row.items()
+                    if k.startswith(prefix)
+                }
 
-            rel_row = {
-                k[len(prefix) :]: v
-                for k, v in row.items()
-                if k.startswith(prefix)
-            }
+                pk_col = (
+                    related_model._meta.pk_field.column
+                    if related_model._meta.pk_field
+                    else "id"
+                )
+                pk_val = rel_row.get(pk_col)
+                if (
+                    not rel_row
+                    or pk_val is None
+                    or pk_val == 0
+                    or all(v is None or v == "" for v in rel_row.values())
+                ):
+                    rel_instance = None
+                else:
+                    rel_instance = related_model._from_row(rel_row)
+                    if self._schema:
+                        rel_instance._schema = self._schema
 
-            pk_col = (
-                related_model._meta.pk_field.column
-                if related_model._meta.pk_field
-                else "id"
-            )
-            pk_val = rel_row.get(pk_col)
-            if (
-                not rel_row
-                or pk_val is None
-                or pk_val == 0
-                or all(v is None or v == "" for v in rel_row.values())
-            ):
-                rel_instance = None
-            else:
-                rel_instance = related_model._from_row(rel_row)
+                cache_key = f"_cache_{rel_name}"
+                object.__setattr__(instance, cache_key, rel_instance)
+                if hasattr(field, "attname"):
+                    fk_pk = rel_instance.pk if rel_instance is not None else None
+                    object.__setattr__(instance, field.attname, fk_pk)
 
-            cache_key = f"_cache_{rel_name}"
-            object.__setattr__(instance, cache_key, rel_instance)
-            if hasattr(field, "attname"):
-                fk_pk = rel_instance.pk if rel_instance is not None else None
-                object.__setattr__(instance, field.attname, fk_pk)
+        if self._schema:
+            instance._schema = self._schema
 
         return instance
 
